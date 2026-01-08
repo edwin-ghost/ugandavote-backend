@@ -5,6 +5,7 @@ from flask_jwt_extended import (
     JWTManager, create_access_token,
     jwt_required, get_jwt_identity
 )
+from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
 from config import Config
 from models import db, User, Bet, BetSelection, Withdrawal, MpesaTransaction, ReferralReward
@@ -264,7 +265,16 @@ def referral_stats():
     })
 
 
+def get_referral_earned_amount(user_id):
+    return db.session.query(
+        func.coalesce(func.sum(ReferralReward.reward_amount), 0)
+    ).filter(
+        ReferralReward.referrer_id == user_id
+    ).scalar()
+
+
 # ---------------- WITHDRAW ----------------
+
 @app.post("/api/withdraw")
 @jwt_required()
 def withdraw():
@@ -276,18 +286,27 @@ def withdraw():
     if amount < 1000:
         return jsonify({"error": "Minimum withdrawal is UGX 1,000"}), 400
 
-    # Can only withdraw real balance, not bonus
+    # Cannot withdraw bonus
     if user.balance < amount:
-        return jsonify({"error": "Insufficient withdrawable balance"}), 400
+        return jsonify({"error": "Insufficient balance"}), 400
 
-    # Must have wagered at least the amount they want to withdraw
-    if user.total_wagered < amount:
-        wager_needed = amount - user.total_wagered
+    # Referral earnings are NOT withdrawable
+    referral_earned = get_referral_earned_amount(user.id)
+
+    # Max withdrawable = balance minus referral earnings
+    withdrawable_amount = max(user.balance - referral_earned, 0)
+
+    if withdrawable_amount <= 0:
         return jsonify({
-            "error": f"You must wager at least UGX {wager_needed:,} more before withdrawing. Total wagered: UGX {user.total_wagered:,}"
+            "error": "Your balance is from referrals and cannot be withdrawn"
         }), 400
 
-    # Create withdrawal request
+    if amount > withdrawable_amount:
+        return jsonify({
+            "error": f"You can only withdraw up to UGX {withdrawable_amount:,}. Referral earnings are locked."
+        }), 400
+
+    # Create withdrawal
     withdrawal = Withdrawal(
         user_id=user.id,
         amount=amount,
@@ -295,17 +314,17 @@ def withdraw():
         status="pending"
     )
 
-    # Deduct from balance
+    # Deduct balance
     user.balance -= amount
-    
+
     db.session.add(withdrawal)
     db.session.commit()
 
     return jsonify({
-        "message": "Withdrawal request submitted successfully",
-        "withdrawal_id": withdrawal.id,
+        "message": "Withdrawal submitted successfully",
         "amount": amount,
-        "remaining_balance": user.balance
+        "remaining_balance": user.balance,
+        "locked_referral_amount": referral_earned
     })
 
 
@@ -325,6 +344,28 @@ def withdrawal_history():
         }
         for w in withdrawals
     ])
+
+
+
+@app.get("/api/admin/users")
+@jwt_required()
+def list_users():
+    users = (
+        User.query
+        .order_by(User.created_at.desc())
+        .all()
+    )
+
+    return jsonify([
+        {
+            "id": u.id,
+            "phone": u.phone,
+            "balance": u.balance,
+            "created_at": u.created_at.isoformat()
+        }
+        for u in users
+    ])
+
 
 
 # ---------------- PAYMENTS ----------------
