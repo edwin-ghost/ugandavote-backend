@@ -7,16 +7,14 @@ from flask_jwt_extended import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from config import Config
-from models import db, User, Bet, BetSelection, Withdrawal, MpesaTransaction
+from models import db, User, Bet, BetSelection, Withdrawal, MpesaTransaction, ReferralReward
 from utils.phone import normalize_phone
 
 app = Flask(__name__)
 app.config.from_object(Config)
 
 CORS(app)
-
-CORS(app, resources={r"/api/*": {"origins": "https://ugandavote.vercel.app"}})
-
+CORS(app, resources={r"/api/*": {"origins": "https://ugandavote.today"}})
 
 database_url = os.getenv("DATABASE_URL", "postgresql://uganda_postgres_user:oSwtZYjUmvGZU0sxnwEJ9oZklgaQrDHH@dpg-d5fc3p0gjchc73f2h2v0-a.oregon-postgres.render.com/uganda_postgres")
 if database_url and database_url.startswith("postgres://"):
@@ -26,26 +24,50 @@ if database_url and database_url.startswith("postgres://"):
 db.init_app(app)
 jwt = JWTManager(app)
 
-# with app.app_context():
-#     db.create_all()
-    
 
 # ---------------- AUTH ----------------
-
 @app.post("/api/auth/register")
 def register():
     data = request.json
 
-    phone = data["phone"]
+    try:
+        phone = normalize_phone(data["phone"])
+    except Exception:
+        return jsonify({"error": "Invalid phone number"}), 400
+
+    referral_code = data.get("referralCode", "").strip().upper()
 
     if User.query.filter_by(phone=phone).first():
         return jsonify({"error": "User exists"}), 400
 
+    # Create new user with bonus balance
     user = User(
         phone=phone,
         pin_hash=generate_password_hash(data["pin"]),
-        balance=0
+        balance=0,
+        bonus_balance=2500,  # Signup bonus
+        total_wagered=0  # Track total amount bet
     )
+
+    # Generate unique referral code
+    user.referral_code = user.generate_referral_code()
+
+    # Process referral if code provided
+    if referral_code:
+        referrer = User.query.filter_by(referral_code=referral_code).first()
+        if referrer:
+            user.referred_by = referral_code
+            
+            # Give referrer 10,000 UGX reward
+            referrer.balance += 10000
+            
+            # Record the referral reward
+            reward = ReferralReward(
+                referrer_id=referrer.id,
+                referred_id=user.id,
+                reward_amount=10000
+            )
+            db.session.add(reward)
 
     db.session.add(user)
     db.session.commit()
@@ -57,7 +79,10 @@ def register():
         "user": {
             "id": user.id,
             "phone": user.phone,
-            "balance": user.balance
+            "balance": user.balance,
+            "bonus_balance": user.bonus_balance,
+            "referral_code": user.referral_code,
+            "total_wagered": user.total_wagered
         }
     }), 201
 
@@ -65,7 +90,13 @@ def register():
 @app.post("/api/auth/login")
 def login():
     data = request.json
-    user = User.query.filter_by(phone=data["phone"]).first()
+
+    try:
+        phone = normalize_phone(data["phone"])
+    except Exception:
+        return jsonify({"error": "Invalid phone number"}), 400
+
+    user = User.query.filter_by(phone=phone).first()
 
     if not user or not check_password_hash(user.pin_hash, data["pin"]):
         return jsonify({"error": "Invalid login"}), 401
@@ -77,18 +108,31 @@ def login():
         "user": {
             "id": user.id,
             "phone": user.phone,
-            "balance": user.balance
+            "balance": user.balance,
+            "bonus_balance": user.bonus_balance,
+            "referral_code": user.referral_code,
+            "total_wagered": user.total_wagered
         }
     })
 
 
 # ---------------- BALANCE ----------------
-
 @app.get("/api/balance")
 @jwt_required()
 def balance():
     user = User.query.get(get_jwt_identity())
-    return jsonify({"balance": user.balance, "currency": "UGX"})
+    
+    # Calculate withdrawable amount (must have wagered at least 1x deposit)
+    withdrawable = min(user.balance, user.total_wagered)
+    
+    return jsonify({
+        "balance": user.balance,
+        "bonus_balance": user.bonus_balance,
+        "withdrawable": withdrawable,
+        "total_wagered": user.total_wagered,
+        "referral_code": user.referral_code,
+        "currency": "UGX"
+    })
 
 
 @app.post("/api/admin/balance")
@@ -102,7 +146,6 @@ def admin_add_balance():
 
 
 # ---------------- BETS ----------------
-
 @app.post("/api/bets")
 @jwt_required()
 def place_bet():
@@ -110,24 +153,34 @@ def place_bet():
     data = request.json
     stake = int(data["stake"])
 
-    if user.balance < stake:
+    # Calculate how much real money and bonus to use
+    real_money_used = min(stake, user.balance)
+    bonus_used = min(stake - real_money_used, user.bonus_balance)
+    
+    total_available = real_money_used + bonus_used
+
+    if total_available < stake:
         return jsonify({"error": "Insufficient balance"}), 400
 
+    # Calculate total odds
     total_odds = 1
     for s in data["selections"]:
         total_odds *= float(s["odds"])
 
     possible_win = int(stake * total_odds)
 
+    # Create bet
     bet = Bet(
         user_id=user.id,
         stake=stake,
         total_odds=round(total_odds, 2),
-        possible_win=possible_win
+        possible_win=possible_win,
+        used_bonus=bonus_used
     )
     db.session.add(bet)
     db.session.flush()
 
+    # Add selections
     for s in data["selections"]:
         db.session.add(BetSelection(
             bet_id=bet.id,
@@ -135,22 +188,32 @@ def place_bet():
             odds=s["odds"]
         ))
 
-    user.balance -= stake
+    # Deduct from balances
+    user.balance -= real_money_used
+    user.bonus_balance -= bonus_used
+    
+    # Track total wagered (only real money, not bonus)
+    user.total_wagered += real_money_used
+    
     db.session.commit()
 
-    return jsonify({"message": "Bet placed", "possible_win": possible_win})
+    return jsonify({
+        "message": "Bet placed successfully",
+        "bet_id": bet.id,
+        "possible_win": possible_win,
+        "bonus_used": bonus_used,
+        "real_money_used": real_money_used
+    })
 
 
 @app.get("/api/bets/history")
 @jwt_required()
 def history():
     user_id = int(get_jwt_identity())
-
     bets = Bet.query.filter_by(user_id=user_id).order_by(Bet.created_at.desc()).all()
 
     bet_history = []
     for bet in bets:
-        # Get all bet selections for this bet
         bet_selections = BetSelection.query.filter_by(bet_id=bet.id).all()
         
         selections = []
@@ -166,6 +229,7 @@ def history():
             "total_odds": bet.total_odds,
             "possible_win": bet.possible_win,
             "status": bet.status,
+            "used_bonus": bet.used_bonus,
             "created_at": bet.created_at.isoformat(),
             "selections": selections
         })
@@ -173,8 +237,34 @@ def history():
     return jsonify(bet_history)
 
 
-# ---------------- WITHDRAW ----------------
+# ---------------- REFERRAL STATS ----------------
+@app.get("/api/referrals/stats")
+@jwt_required()
+def referral_stats():
+    user = User.query.get(get_jwt_identity())
+    
+    # Count successful referrals
+    referred_users = User.query.filter_by(referred_by=user.referral_code).count()
+    
+    # Total earnings from referrals
+    rewards = ReferralReward.query.filter_by(referrer_id=user.id).all()
+    total_earned = sum(r.reward_amount for r in rewards)
+    
+    return jsonify({
+        "referral_code": user.referral_code,
+        "total_referrals": referred_users,
+        "total_earned": total_earned,
+        "recent_referrals": [
+            {
+                "reward": r.reward_amount,
+                "date": r.created_at.isoformat()
+            }
+            for r in rewards[-5:]  # Last 5 referrals
+        ]
+    })
 
+
+# ---------------- WITHDRAW ----------------
 @app.post("/api/withdraw")
 @jwt_required()
 def withdraw():
@@ -182,25 +272,62 @@ def withdraw():
     data = request.json
     amount = int(data["amount"])
 
-    if user.balance < amount:
-        return jsonify({"error": "Insufficient balance"}), 400
+    # Minimum withdrawal
+    if amount < 1000:
+        return jsonify({"error": "Minimum withdrawal is UGX 1,000"}), 400
 
+    # Can only withdraw real balance, not bonus
+    if user.balance < amount:
+        return jsonify({"error": "Insufficient withdrawable balance"}), 400
+
+    # Must have wagered at least the amount they want to withdraw
+    if user.total_wagered < amount:
+        wager_needed = amount - user.total_wagered
+        return jsonify({
+            "error": f"You must wager at least UGX {wager_needed:,} more before withdrawing. Total wagered: UGX {user.total_wagered:,}"
+        }), 400
+
+    # Create withdrawal request
     withdrawal = Withdrawal(
         user_id=user.id,
         amount=amount,
-        method=data["method"]
+        method=data.get("method", "MTN"),
+        status="pending"
     )
 
+    # Deduct from balance
     user.balance -= amount
+    
     db.session.add(withdrawal)
     db.session.commit()
 
-    return jsonify({"message": "Withdrawal request submitted"})
+    return jsonify({
+        "message": "Withdrawal request submitted successfully",
+        "withdrawal_id": withdrawal.id,
+        "amount": amount,
+        "remaining_balance": user.balance
+    })
 
+
+@app.get("/api/withdrawals/history")
+@jwt_required()
+def withdrawal_history():
+    user_id = int(get_jwt_identity())
+    withdrawals = Withdrawal.query.filter_by(user_id=user_id).order_by(Withdrawal.created_at.desc()).all()
+    
+    return jsonify([
+        {
+            "id": w.id,
+            "amount": w.amount,
+            "method": w.method,
+            "status": w.status,
+            "created_at": w.created_at.isoformat()
+        }
+        for w in withdrawals
+    ])
 
 
 # ---------------- PAYMENTS ----------------
-
 from services.mpesa import MpesaService
 
 @app.post("/api/payments/mpesa")
@@ -210,77 +337,74 @@ def mpesa_payment():
     data = request.json
 
     try:
-        phone = normalize_phone(data.get("phone"))
+        phone_local = normalize_phone(data.get("phone"))
         amount = int(data.get("amount"))
     except Exception:
-        return jsonify({"message": "Invalid phone number"}), 400
-    
-    amount = data.get("amount")
+        return jsonify({"message": "Invalid phone number or amount"}), 400
 
-    if not phone or not amount:
-        return jsonify({"message": "Phone and amount required"}), 400
+    if amount < 100:
+        return jsonify({"message": "Minimum deposit is UGX 100"}), 400
 
-    try:
-        mpesa = MpesaService()
-        response = mpesa.stk_push(
-            phone=phone,
-            amount=int(amount),
-            reference=f"TOPUP-{user.id}", user_id=user.id
-        )
+    mpesa_phone = "254" + phone_local
 
-      
+    mpesa = MpesaService()
+    response = mpesa.stk_push(
+        phone=mpesa_phone,
+        amount=amount,
+        reference=f"TOPUP-{user.id}",
+        user_id=user.id
+    )
 
-        return jsonify({
-            "message": "STK Push sent",
-            "mpesa": response
-        })
+    return jsonify({
+        "message": "STK Push sent",
+        "mpesa": response
+    })
 
-    except Exception as e:
-        print(e)
-        return jsonify({
-            "message": "Failed to initiate Mpesa payment"
-        }), 500
-    
-
-
-# app.py
 
 @app.post("/api/payments/mpesa/callback")
 def mpesa_callback():
     data = request.json
     print("Mpesa callback received:", data)
+
     try:
-        callback_items = data.get("Body", {}).get("stkCallback", {}).get("CallbackMetadata", {}).get("Item", [])
-        checkout_request_id = data.get("Body", {}).get("stkCallback", {}).get("CheckoutRequestID")
-        result_code = int(data.get("Body", {}).get("stkCallback", {}).get("ResultCode", 1))
+        stk = data["Body"]["stkCallback"]
+        result_code = int(stk["ResultCode"])
+        checkout_request_id = stk["CheckoutRequestID"]
 
-        amount = next((i["Value"] for i in callback_items if i["Name"] == "Amount"), 0)
-        phone = next((i["Value"] for i in callback_items if i["Name"] == "PhoneNumber"), None)
+        items = stk.get("CallbackMetadata", {}).get("Item", [])
+        amount = next(i["Value"] for i in items if i["Name"] == "Amount")
+        phone_254 = next(i["Value"] for i in items if i["Name"] == "PhoneNumber")
 
-        txn = MpesaTransaction.query.filter_by(checkout_request_id=checkout_request_id).first()
+        phone = normalize_phone(phone_254)
+
+        txn = MpesaTransaction.query.filter_by(
+            checkout_request_id=checkout_request_id
+        ).first()
+
         if not txn:
             txn = MpesaTransaction(
-                user_id=None,
                 phone=phone,
                 amount=amount,
-                checkout_request_id=checkout_request_id,
-                status="SUCCESS" if result_code == 0 else "FAILED"
+                checkout_request_id=checkout_request_id
             )
             db.session.add(txn)
-        else:
-            txn.status = "SUCCESS" if result_code == 0 else "FAILED"
 
-        if result_code == 0 and phone:
+        txn.status = "SUCCESS" if result_code == 0 else "FAILED"
+
+        # Credit user balance on success
+        if result_code == 0:
             user = User.query.filter_by(phone=phone).first()
             if user:
                 user.balance += int(amount)
+                txn.user_id = user.id
 
         db.session.commit()
         return jsonify({"message": "Callback processed"}), 200
+
     except Exception as e:
         print("Mpesa callback error:", e)
         return jsonify({"message": "Callback failed"}), 500
-    
+
 
 @app.post("/api/payments/mpesa/update_pending")
 def update_pending():
@@ -292,8 +416,6 @@ def update_pending():
         print("Update pending error:", e)
         return jsonify({"message": "Failed to update pending"}), 500
 
-
-# ---------------- RUN ----------------
 
 if __name__ == "__main__":
     app.run()
