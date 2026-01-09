@@ -487,6 +487,73 @@ def update_pending():
 # ------------------------------
 # Elections & Candidates
 # ------------------------------
+
+
+
+@app.post("/election")
+def create_election():
+    """Create a new election"""
+    data = request.json
+    
+    # Check if election already exists
+    existing = Election.query.get(data.get("id"))
+    if existing:
+        return jsonify({"error": "Election with this ID already exists"}), 400
+    
+    # Validate required fields
+    if not data.get("id") or not data.get("title"):
+        return jsonify({"error": "ID and title are required"}), 400
+    
+    election = Election(
+        id=data.get("id"),
+        title=data.get("title"),
+        constituency=data.get("constituency"),
+        type=data.get("type", "presidential")
+    )
+    
+    db.session.add(election)
+    db.session.commit()
+    
+    return jsonify({"success": True, "id": election.id})
+
+
+@app.put("/election/<string:id>")
+def update_election(id):
+    """Update an existing election"""
+    data = request.json
+    election = Election.query.get(id)
+    
+    if not election:
+        return jsonify({"error": "Election not found"}), 404
+    
+    # Update fields
+    election.title = data.get("title", election.title)
+    election.constituency = data.get("constituency", election.constituency)
+    election.type = data.get("type", election.type)
+    
+    db.session.commit()
+    
+    return jsonify({"success": True})
+
+
+@app.delete("/election/<string:id>")
+def delete_election(id):
+    """Delete an election and all its candidates"""
+    election = Election.query.get(id)
+    
+    if not election:
+        return jsonify({"error": "Election not found"}), 404
+    
+    # Delete all candidates first (if no cascade is set)
+    Candidate.query.filter_by(election_id=id).delete()
+    
+    # Delete the election
+    db.session.delete(election)
+    db.session.commit()
+    
+    return jsonify({"success": True})
+
+
 @app.get("/elections")
 def get_elections():
     elections = Election.query.all()
