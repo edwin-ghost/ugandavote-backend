@@ -599,7 +599,7 @@ def get_elections():
         })
     return jsonify(result)
 
-@app.post("/api/candidate")
+@app.post("/candidate")
 def create_candidate():
     data = request.json
     candidate = Candidate(
@@ -613,7 +613,7 @@ def create_candidate():
     db.session.commit()
     return jsonify({"success": True, "id": candidate.id})
 
-@app.put("/api/candidate/<int:id>")
+@app.put("/candidate/<int:id>")
 def update_candidate(id):
     data = request.json
     candidate = Candidate.query.get(id)
@@ -626,7 +626,7 @@ def update_candidate(id):
     db.session.commit()
     return jsonify({"success": True})
 
-@app.delete("/api/candidate/<int:id>")
+@app.delete("/candidate/<int:id>")
 def delete_candidate(id):
     candidate = Candidate.query.get(id)
     if not candidate:
