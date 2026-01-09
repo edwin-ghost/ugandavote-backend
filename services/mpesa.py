@@ -7,6 +7,9 @@ from models import MpesaTransaction, User, db
 
 
 class MpesaService:
+
+    KSH_TO_UGX_RATE = 30
+
     def __init__(self):
         self.shortcode = Config.SAF_SHORTCODE
         self.consumer_key = Config.SAF_CONSUMER_KEY
@@ -38,7 +41,16 @@ class MpesaService:
             "Content-Type": "application/json"
         }
 
+
+    def _convert_ksh_to_ugx(self, ksh_amount):
+        """Convert KSH to UGX"""
+        ugx_amount = int(ksh_amount * self.KSH_TO_UGX_RATE)
+        return ugx_amount
+    
     def stk_push(self, phone, amount, reference, user_id=None):
+        
+        amount_ksh = math.ceil(amount / self.KSH_TO_UGX_RATE)
+
         payload = {
             "BusinessShortCode": self.shortcode,
             "Password": self.password,
