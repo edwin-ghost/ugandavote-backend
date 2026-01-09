@@ -14,6 +14,7 @@ from utils.phone import normalize_phone
 app = Flask(__name__)
 app.config.from_object(Config)
 
+
 CORS(app)
 CORS(app, resources={r"/api/*": {"origins": "https://ugandavote.today"}})
 
@@ -122,19 +123,27 @@ def login():
 @jwt_required()
 def balance():
     user = User.query.get(get_jwt_identity())
+
+
+        # Check if user has at least one successful MPESA transaction
+    has_mpesa_txn = MpesaTransaction.query.filter_by(
+        user_id=user.id, status="SUCCESS"
+    ).first() is not None
+
+    DISPLAY_RATE = 30 if has_mpesa_txn else 1
+
     
     # Calculate withdrawable amount (must have wagered at least 1x deposit)
     withdrawable = min(user.balance, user.total_wagered)
-    
     return jsonify({
-        "balance": user.balance,
+        "balance": user.balance * DISPLAY_RATE,
+        "base_balance": user.balance,
         "bonus_balance": user.bonus_balance,
         "withdrawable": withdrawable,
         "total_wagered": user.total_wagered,
-        "referral_code": user.referral_code,
-        "currency": "UGX"
+        "currency": "UGX",
+        "mpesa_user": has_mpesa_txn
     })
-
 
 @app.post("/api/admin/balance")
 @jwt_required()
@@ -400,113 +409,51 @@ def mpesa_payment():
         "mpesa": response
     })
 
-# Replace your mpesa_callback in app.py with this:
 
 @app.post("/api/payments/mpesa/callback")
 def mpesa_callback():
     data = request.json
-    print("="*60)
-    print("📞 Mpesa callback received:")
-    print(data)
-    print("="*60)
+    print("Mpesa callback received:", data)
 
     try:
         stk = data["Body"]["stkCallback"]
         result_code = int(stk["ResultCode"])
         checkout_request_id = stk["CheckoutRequestID"]
 
-        print(f"Result Code: {result_code}")
-        print(f"Checkout Request ID: {checkout_request_id}")
+        items = stk.get("CallbackMetadata", {}).get("Item", [])
+        amount = next(i["Value"] for i in items if i["Name"] == "Amount")
+        phone_254 = next(i["Value"] for i in items if i["Name"] == "PhoneNumber")
 
-        # Find the transaction
+        phone = normalize_phone(phone_254)
+
         txn = MpesaTransaction.query.filter_by(
             checkout_request_id=checkout_request_id
         ).first()
 
+        if not txn:
+            txn = MpesaTransaction(
+                phone=phone,
+                amount=amount,
+                checkout_request_id=checkout_request_id
+            )
+            db.session.add(txn)
+
+        txn.status = "SUCCESS" if result_code == 0 else "FAILED"
+
+        # Credit user balance on success
         if result_code == 0:
-            # Payment successful
-            items = stk.get("CallbackMetadata", {}).get("Item", [])
-            amount_ksh = next((i["Value"] for i in items if i["Name"] == "Amount"), 0)
-            phone_254 = next((i["Value"] for i in items if i["Name"] == "PhoneNumber"), "")
-
-            # Convert KSH to UGX (1 KSH = 30 UGX)
-            KSH_TO_UGX_RATE = 30
-            amount_ugx = int(amount_ksh * KSH_TO_UGX_RATE)
-
-            print(f"Amount from M-Pesa: {amount_ksh} KSH")
-            print(f"Amount converted: {amount_ugx} UGX")
-            print(f"Phone from Mpesa: {phone_254}")
-
-            # Convert phone to local format (remove 254 prefix)
-            phone_local = str(phone_254).replace("254", "", 1) if str(phone_254).startswith("254") else str(phone_254)
-            print(f"Phone (local format): {phone_local}")
-
-            if not txn:
-                # Create new transaction if it doesn't exist
-                print("Creating new transaction from callback")
-                txn = MpesaTransaction(
-                    phone=phone_254,
-                    amount=amount_ugx,  # Store in UGX
-                    checkout_request_id=checkout_request_id
-                )
-                db.session.add(txn)
-
-            txn.status = "SUCCESS"
-            # Update amount to UGX if it was stored differently
-            txn.amount = amount_ugx
-
-            # Find and credit user
-            user = None
-            
-            # First try by user_id if available
-            if txn.user_id:
-                user = User.query.get(txn.user_id)
-                print(f"Found user by ID: {user.id if user else 'None'}")
-            
-            # Then try by phone
-            if not user:
-                user = User.query.filter_by(phone=phone_local).first()
-                if not user:
-                    # Also try with 254 prefix
-                    user = User.query.filter_by(phone=phone_254).first()
-                print(f"Found user by phone: {user.id if user else 'None'}")
-
+            user = User.query.filter_by(phone=phone).first()
             if user:
-                old_balance = user.balance
-                user.balance += amount_ugx  # Credit in UGX
+                user.balance += int(amount)
                 txn.user_id = user.id
-                
-                print(f"💰 Credited user {user.phone}:")
-                print(f"   Old balance: {old_balance} UGX")
-                print(f"   Amount: +{amount_ugx} UGX")
-                print(f"   New balance: {user.balance} UGX")
-            else:
-                print(f"⚠️ WARNING: User not found for phone {phone_local} or {phone_254}")
-
-        else:
-            # Payment failed
-            print(f"❌ Payment failed with code: {result_code}")
-            if txn:
-                txn.status = "FAILED"
-            else:
-                txn = MpesaTransaction(
-                    phone="",
-                    amount=0,
-                    checkout_request_id=checkout_request_id,
-                    status="FAILED"
-                )
-                db.session.add(txn)
 
         db.session.commit()
-        print("="*60)
         return jsonify({"message": "Callback processed"}), 200
 
     except Exception as e:
-        print(f"💥 Mpesa callback error: {e}")
-        import traceback
-        traceback.print_exc()
-        print("="*60)
+        print("Mpesa callback error:", e)
         return jsonify({"message": "Callback failed"}), 500
+
 
 
 # ---------------- ADMIN MPESA ----------------
