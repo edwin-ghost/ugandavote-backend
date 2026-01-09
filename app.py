@@ -490,7 +490,7 @@ def update_pending():
 
 
 
-@app.post("/api/election")
+@app.post("/election")
 def create_election():
     """Create a new election"""
     data = request.json
@@ -517,7 +517,7 @@ def create_election():
     return jsonify({"success": True, "id": election.id})
 
 
-@app.get("/api/election/<string:id>")
+@app.get("/election/<string:id>")
 def get_election(id):
     """Get a single election with its candidates"""
     election = Election.query.get(id)
@@ -542,7 +542,7 @@ def get_election(id):
     })
 
 
-@app.put("/api/election/<string:id>")
+@app.put("/election/<string:id>")
 def update_election(id):
     """Update an existing election"""
     data = request.json
@@ -561,7 +561,7 @@ def update_election(id):
     return jsonify({"success": True})
 
 
-@app.delete("/api/election/<string:id>")
+@app.delete("/election/<string:id>")
 def delete_election(id):
     """Delete an election and all its candidates"""
     election = Election.query.get(id)
@@ -578,8 +578,7 @@ def delete_election(id):
     
     return jsonify({"success": True})
 
-
-@app.get("/api/elections")
+@app.get("/elections")
 def get_elections():
     elections = Election.query.all()
     result = []
