@@ -83,21 +83,89 @@ class MpesaService:
 
     def update_pending_transactions(self):
         pending_txns = MpesaTransaction.query.filter_by(status="PENDING").all()
+        
+        print(f"\n{'='*60}")
+        print(f"🔄 Processing {len(pending_txns)} pending transactions")
+        print(f"{'='*60}\n")
+        
+        updated_count = 0
+        
         for txn in pending_txns:
             try:
+                print(f"📋 Transaction #{txn.id}")
+                print(f"   User ID: {txn.user_id}")
+                print(f"   Amount: {txn.amount:,} UGX")
+                print(f"   Checkout: {txn.checkout_request_id}")
+                
+                # Query M-Pesa for transaction status
                 response = self.query_transaction(txn.checkout_request_id)
                 result_code = int(response.get("ResultCode", 1))
+                result_desc = response.get("ResultDesc", "Unknown")
+                
+                print(f"   M-Pesa Response: {result_code} - {result_desc}")
 
                 if result_code == 0:
-                    txn.status = "SUCCESS"
-                    if txn.phone:
-                        user = User.query.filter_by(phone=txn.phone).first()
-                        if user:
-                            print(f"Crediting {txn.amount} to user {user.phone}")
-                            user.balance += int(txn.amount)
+                    # ✅ Transaction successful
+                    print(f"   ✅ Payment SUCCESSFUL")
+                    
+                    # Get the user
+                    user = User.query.get(txn.user_id)
+                    
+                    if user:
+                        # Update user balance
+                        old_balance = user.balance
+                        user.balance += int(txn.amount)
+                        new_balance = user.balance
+                        
+                        # Update transaction status
+                        txn.status = "SUCCESS"
+                        txn.updated_at = datetime.utcnow()
+                        
+                        # Commit to database
+                        db.session.commit()
+                        
+                        print(f"   💰 CREDITED USER!")
+                        print(f"      Phone: {user.phone}")
+                        print(f"      Old Balance: {old_balance:,} UGX")
+                        print(f"      Added: +{txn.amount:,} UGX")
+                        print(f"      New Balance: {new_balance:,} UGX")
+                        
+                        updated_count += 1
+                    else:
+                        print(f"   ❌ ERROR: User ID {txn.user_id} not found!")
+                        txn.status = "SUCCESS_NO_USER"
+                        txn.updated_at = datetime.utcnow()
+                        db.session.commit()
+                        
+                elif result_code == 1032:
+                    # 🚫 User cancelled
+                    print(f"   🚫 CANCELLED by user")
+                    txn.status = "CANCELLED"
+                    txn.updated_at = datetime.utcnow()
+                    db.session.commit()
+                    
+                elif result_code == 1:
+                    # ⏳ Still pending
+                    print(f"   ⏳ Still PENDING")
+                    
                 else:
+                    # ❌ Failed
+                    print(f"   ❌ FAILED")
                     txn.status = "FAILED"
-
-                db.session.commit()
+                    txn.updated_at = datetime.utcnow()
+                    db.session.commit()
+                
+                print()  # Empty line between transactions
+                
             except Exception as e:
-                print(f"Failed to update txn {txn.checkout_request_id}: {e}")
+                print(f"   💥 ERROR: {e}")
+                import traceback
+                traceback.print_exc()
+                db.session.rollback()
+                print()
+        
+        print(f"{'='*60}")
+        print(f"✨ Complete! Updated {updated_count} transaction(s)")
+        print(f"{'='*60}\n")
+        
+        return updated_count

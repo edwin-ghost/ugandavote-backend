@@ -383,8 +383,7 @@ def mpesa_payment():
     except Exception:
         return jsonify({"message": "Invalid phone number or amount"}), 400
 
-    if amount < 100:
-        return jsonify({"message": "Minimum deposit is UGX 100"}), 400
+
 
     mpesa_phone = "254" + phone_local
 
