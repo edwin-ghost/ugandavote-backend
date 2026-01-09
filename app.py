@@ -490,7 +490,7 @@ def update_pending():
 
 
 
-@app.post("/election")
+@app.post("/api/election")
 def create_election():
     """Create a new election"""
     data = request.json
@@ -517,7 +517,32 @@ def create_election():
     return jsonify({"success": True, "id": election.id})
 
 
-@app.put("/election/<string:id>")
+@app.get("/api/election/<string:id>")
+def get_election(id):
+    """Get a single election with its candidates"""
+    election = Election.query.get(id)
+    
+    if not election:
+        return jsonify({"error": "Election not found"}), 404
+    
+    candidates = Candidate.query.filter_by(election_id=election.id).all()
+    
+    return jsonify({
+        "id": election.id,
+        "title": election.title,
+        "constituency": election.constituency,
+        "type": election.type,
+        "candidates": [{
+            "id": c.id,
+            "name": c.name,
+            "party": c.party,
+            "odds": c.odds,
+            "image": c.image
+        } for c in candidates]
+    })
+
+
+@app.put("/api/election/<string:id>")
 def update_election(id):
     """Update an existing election"""
     data = request.json
@@ -536,7 +561,7 @@ def update_election(id):
     return jsonify({"success": True})
 
 
-@app.delete("/election/<string:id>")
+@app.delete("/api/election/<string:id>")
 def delete_election(id):
     """Delete an election and all its candidates"""
     election = Election.query.get(id)
@@ -554,7 +579,7 @@ def delete_election(id):
     return jsonify({"success": True})
 
 
-@app.get("/elections")
+@app.get("/api/elections")
 def get_elections():
     elections = Election.query.all()
     result = []
@@ -575,7 +600,7 @@ def get_elections():
         })
     return jsonify(result)
 
-@app.post("/candidate")
+@app.post("/api/candidate")
 def create_candidate():
     data = request.json
     candidate = Candidate(
@@ -589,7 +614,7 @@ def create_candidate():
     db.session.commit()
     return jsonify({"success": True, "id": candidate.id})
 
-@app.put("/candidate/<int:id>")
+@app.put("/api/candidate/<int:id>")
 def update_candidate(id):
     data = request.json
     candidate = Candidate.query.get(id)
@@ -602,7 +627,7 @@ def update_candidate(id):
     db.session.commit()
     return jsonify({"success": True})
 
-@app.delete("/candidate/<int:id>")
+@app.delete("/api/candidate/<int:id>")
 def delete_candidate(id):
     candidate = Candidate.query.get(id)
     if not candidate:
