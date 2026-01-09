@@ -85,3 +85,20 @@ class ReferralReward(db.Model):
     referred_id = db.Column(db.Integer, db.ForeignKey("user.id"))
     reward_amount = db.Column(db.Integer, default=10000)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Election(db.Model):
+    id = db.Column(db.String, primary_key=True)
+    title = db.Column(db.String(255))
+    constituency = db.Column(db.String(255))
+    type = db.Column(db.String(50))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Candidate(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    election_id = db.Column(db.String, db.ForeignKey('election.id'))
+    name = db.Column(db.String(255))
+    party = db.Column(db.String(100))
+    odds = db.Column(db.Float)
+    image = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)

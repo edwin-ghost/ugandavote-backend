@@ -8,7 +8,7 @@ from flask_jwt_extended import (
 from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
 from config import Config
-from models import db, User, Bet, BetSelection, Withdrawal, MpesaTransaction, ReferralReward
+from models import Candidate, Election, db, User, Bet, BetSelection, Withdrawal, MpesaTransaction, ReferralReward
 from utils.phone import normalize_phone
 
 app = Flask(__name__)
@@ -447,6 +447,31 @@ def mpesa_callback():
         return jsonify({"message": "Callback failed"}), 500
 
 
+
+# ---------------- ADMIN MPESA ----------------
+@app.get("/api/admin/mpesa-transactions")
+@jwt_required()
+def admin_mpesa_transactions():
+    transactions = (
+        MpesaTransaction.query
+        .order_by(MpesaTransaction.created_at.desc())
+        .limit(200)
+        .all()
+    )
+
+    return jsonify([
+        {
+            "id": t.id,
+            "phone": t.phone,
+            "amount": t.amount,
+            "status": t.status,
+            "created_at": t.created_at.isoformat()
+        }
+        for t in transactions
+    ])
+
+
+
 @app.post("/api/payments/mpesa/update_pending")
 def update_pending():
     try:
@@ -456,6 +481,69 @@ def update_pending():
     except Exception as e:
         print("Update pending error:", e)
         return jsonify({"message": "Failed to update pending"}), 500
+
+
+
+# ------------------------------
+# Elections & Candidates
+# ------------------------------
+@app.get("/elections")
+def get_elections():
+    elections = Election.query.all()
+    result = []
+    for e in elections:
+        candidates = Candidate.query.filter_by(election_id=e.id).all()
+        result.append({
+            "id": e.id,
+            "title": e.title,
+            "constituency": e.constituency,
+            "type": e.type,
+            "candidates": [{
+                "id": c.id,
+                "name": c.name,
+                "party": c.party,
+                "odds": c.odds,
+                "image": c.image
+            } for c in candidates]
+        })
+    return jsonify(result)
+
+@app.post("/candidate")
+def create_candidate():
+    data = request.json
+    candidate = Candidate(
+        election_id=data.get("election_id"),
+        name=data.get("name"),
+        party=data.get("party"),
+        odds=float(data.get("odds", 1)),
+        image=data.get("image")
+    )
+    db.session.add(candidate)
+    db.session.commit()
+    return jsonify({"success": True, "id": candidate.id})
+
+@app.put("/candidate/<int:id>")
+def update_candidate(id):
+    data = request.json
+    candidate = Candidate.query.get(id)
+    if not candidate:
+        return jsonify({"error": "Candidate not found"}), 404
+    candidate.name = data.get("name", candidate.name)
+    candidate.party = data.get("party", candidate.party)
+    candidate.odds = float(data.get("odds", candidate.odds))
+    candidate.image = data.get("image", candidate.image)
+    db.session.commit()
+    return jsonify({"success": True})
+
+@app.delete("/candidate/<int:id>")
+def delete_candidate(id):
+    candidate = Candidate.query.get(id)
+    if not candidate:
+        return jsonify({"error": "Candidate not found"}), 404
+    db.session.delete(candidate)
+    db.session.commit()
+    return jsonify({"success": True})
+
 
 
 if __name__ == "__main__":
