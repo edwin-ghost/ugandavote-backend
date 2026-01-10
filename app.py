@@ -353,26 +353,40 @@ def withdrawal_history():
         for w in withdrawals
     ])
 
-# New Admin Endpoint - Get all withdrawal requests
+
 @app.get("/admin/withdrawals")
 def get_admin_withdrawals():
     # Add admin authentication here if needed
     withdrawals = Withdrawal.query.order_by(Withdrawal.created_at.desc()).all()
     
-    return jsonify([
-        {
+    result = []
+    for w in withdrawals:
+        user = User.query.get(w.user_id)
+        
+        # Check if user has made any M-Pesa transactions
+        has_mpesa = False
+        if user:
+            mpesa_count = MpesaTransaction.query.filter_by(
+                user_id=user.id,
+                status='SUCCESS'
+            ).count()
+            has_mpesa = mpesa_count > 0
+        
+        result.append({
             "id": w.id,
             "user_id": w.user_id,
-            "phone": User.query.get(w.user_id).phone if User.query.get(w.user_id) else "Unknown",
+            "phone": user.phone if user else "Unknown",
             "amount": w.amount,
             "method": w.method,
             "status": w.status,
+            "user_balance": user.balance if user else 0,
+            "is_mpesa_user": has_mpesa,
             "created_at": w.created_at.isoformat()
-        }
-        for w in withdrawals
-    ])
+        })
+    
+    return jsonify(result)
 
-# New Admin Endpoint - Update withdrawal status
+# Update withdrawal status
 @app.put("/admin/withdrawals/<int:withdrawal_id>")
 def update_withdrawal_status(withdrawal_id):
     data = request.get_json()
@@ -395,7 +409,6 @@ def update_withdrawal_status(withdrawal_id):
             "status": withdrawal.status
         }
     })
-    
 @app.get("/api/admin/users")
 @jwt_required()
 def list_users():
