@@ -336,7 +336,7 @@ def withdraw():
         "locked_referral_amount": referral_earned
     })
 
-@app.get("/withdrawals/history")
+@app.get("/api/withdrawals/history")
 @jwt_required()
 def withdrawal_history():
     user_id = int(get_jwt_identity())
@@ -395,7 +395,7 @@ def update_withdrawal_status(withdrawal_id):
             "status": withdrawal.status
         }
     })
-
+    
 @app.get("/api/admin/users")
 @jwt_required()
 def list_users():
