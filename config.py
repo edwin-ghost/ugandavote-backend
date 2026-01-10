@@ -9,6 +9,28 @@ class Config:
 
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'pool_size': 10,           # Number of connections to keep open
+        'pool_recycle': 3600,      # Recycle connections after 1 hour
+        'pool_pre_ping': True,     # Test connections before using
+        'max_overflow': 5,         # Extra connections when pool is full
+        'pool_timeout': 30,        # Timeout for getting connection
+        'echo': False              # Don't log SQL queries (set True for debugging)
+    }
+    
+    # NEW: Compression settings
+    COMPRESS_MIMETYPES = [
+        'text/html',
+        'text/css',
+        'text/xml',
+        'application/json',
+        'application/javascript'
+    ]
+    COMPRESS_LEVEL = 6  # Compression level (1-9, higher = more compression)
+    COMPRESS_MIN_SIZE = 500  # Only compress responses larger than 500 bytes
+
+
+
 
         # JWT
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)

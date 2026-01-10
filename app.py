@@ -1,6 +1,7 @@
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
+from flask_compress import Compress  # NEW: pip install flask-compress
 from flask_jwt_extended import (
     JWTManager, create_access_token,
     jwt_required, get_jwt_identity
@@ -10,13 +11,29 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from config import Config
 from models import Candidate, Election, db, User, Bet, BetSelection, Withdrawal, MpesaTransaction, ReferralReward
 from utils.phone import normalize_phone
+from functools import wraps
+import hashlib
+from datetime import datetime, timedelta
+from threading import Thread
+import time
+import requests as req
 
 app = Flask(__name__)
 app.config.from_object(Config)
 
+# NEW: Enable compression
+compress = Compress()
+compress.init_app(app)
 
-CORS(app)
-CORS(app, resources={r"/api/*": {"origins": "https://ugandavote.today"}})
+# UPDATED: Optimized CORS
+CORS(app, resources={
+    r"/*": {
+        "origins": ["https://ugandavote.today", "http://localhost:8081"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "max_age": 3600  # Cache preflight for 1 hour
+    }
+})
 
 database_url = os.getenv("DATABASE_URL", "postgresql://uganda_postgres_user:oSwtZYjUmvGZU0sxnwEJ9oZklgaQrDHH@dpg-d5fc3p0gjchc73f2h2v0-a.oregon-postgres.render.com/uganda_postgres")
 if database_url and database_url.startswith("postgres://"):
@@ -25,6 +42,74 @@ if database_url and database_url.startswith("postgres://"):
     
 db.init_app(app)
 jwt = JWTManager(app)
+
+
+# ===============================
+# NEW: CACHING SYSTEM
+# ===============================
+cache_store = {}
+
+def cache_response(duration=300):
+    """Cache GET responses for specified duration (seconds)"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            # Only cache GET requests
+            if request.method != 'GET':
+                return f(*args, **kwargs)
+            
+            # Create cache key from URL, args, and auth header
+            auth_header = request.headers.get('Authorization', '')
+            cache_key = hashlib.md5(
+                f"{request.url}{str(args)}{str(kwargs)}{auth_header}".encode()
+            ).hexdigest()
+            
+            # Check cache
+            if cache_key in cache_store:
+                cached_data, expiry = cache_store[cache_key]
+                if datetime.now() < expiry:
+                    response = make_response(jsonify(cached_data))
+                    response.headers['X-Cache'] = 'HIT'
+                    return response
+            
+            # Execute function
+            result = f(*args, **kwargs)
+            
+            # Cache successful responses
+            if isinstance(result, tuple):
+                data, status = result
+                if status == 200:
+                    if hasattr(data, 'get_json'):
+                        cache_store[cache_key] = (data.get_json(), datetime.now() + timedelta(seconds=duration))
+            else:
+                if hasattr(result, 'get_json'):
+                    cache_store[cache_key] = (result.get_json(), datetime.now() + timedelta(seconds=duration))
+            
+            return result
+        return decorated_function
+    return decorator
+
+
+# ===============================
+# NEW: KEEP ALIVE FOR RENDER
+# ===============================
+def keep_alive():
+    """Ping self every 10 minutes to prevent Render free tier sleep"""
+    base_url = os.getenv("BASE_URL", "https://ugandavote-backend.onrender.com")
+    while True:
+        try:
+            time.sleep(600)  # 10 minutes
+            req.get(f"{base_url}/health", timeout=5)
+        except:
+            pass
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+# Start keep-alive only in production
+if os.getenv("FLASK_ENV") == "production" or os.getenv("RENDER"):
+    Thread(target=keep_alive, daemon=True).start()
 
 
 # ---------------- AUTH ----------------
@@ -42,28 +127,22 @@ def register():
     if User.query.filter_by(phone=phone).first():
         return jsonify({"error": "User exists"}), 400
 
-    # Create new user with bonus balance
     user = User(
         phone=phone,
         pin_hash=generate_password_hash(data["pin"]),
         balance=0,
-        bonus_balance=2500,  # Signup bonus
-        total_wagered=0  # Track total amount bet
+        bonus_balance=2500,
+        total_wagered=0
     )
 
-    # Generate unique referral code
     user.referral_code = user.generate_referral_code()
 
-    # Process referral if code provided
     if referral_code:
         referrer = User.query.filter_by(referral_code=referral_code).first()
         if referrer:
             user.referred_by = referral_code
-            
-            # Give referrer 10,000 UGX reward
             referrer.balance += 10000
             
-            # Record the referral reward
             reward = ReferralReward(
                 referrer_id=referrer.id,
                 referred_id=user.id,
@@ -118,23 +197,30 @@ def login():
     })
 
 
-# ---------------- BALANCE ----------------
+# ---------------- BALANCE (OPTIMIZED) ----------------
 @app.get("/api/balance")
 @jwt_required()
+@cache_response(duration=30)  # Cache for 30 seconds
 def balance():
-    user = User.query.get(get_jwt_identity())
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user:
+        return jsonify({"error": "User not found"}), 404
 
-
-        # Check if user has at least one successful MPESA transaction
-    has_mpesa_txn = MpesaTransaction.query.filter_by(
-        user_id=user.id, status="SUCCESS"
-    ).first() is not None
+    # Optimized query using exists
+    has_mpesa_txn = db.session.query(
+        db.exists().where(
+            db.and_(
+                MpesaTransaction.user_id == user.id,
+                MpesaTransaction.status == "SUCCESS"
+            )
+        )
+    ).scalar()
 
     DISPLAY_RATE = 30 if has_mpesa_txn else 1
-
-    
-    # Calculate withdrawable amount (must have wagered at least 1x deposit)
     withdrawable = min(user.balance, user.total_wagered)
+    
     return jsonify({
         "balance": user.balance * DISPLAY_RATE,
         "base_balance": user.balance,
@@ -144,6 +230,7 @@ def balance():
         "currency": "UGX",
         "mpesa_user": has_mpesa_txn
     })
+
 
 @app.post("/api/admin/balance")
 @jwt_required()
@@ -155,7 +242,7 @@ def admin_add_balance():
     return jsonify({"message": "Balance updated"})
 
 
-# ---------------- BETS ----------------
+# ---------------- BETS (OPTIMIZED) ----------------
 @app.post("/api/bets")
 @jwt_required()
 def place_bet():
@@ -163,23 +250,19 @@ def place_bet():
     data = request.json
     stake = int(data["stake"])
 
-    # Calculate how much real money and bonus to use
     real_money_used = min(stake, user.balance)
     bonus_used = min(stake - real_money_used, user.bonus_balance)
-    
     total_available = real_money_used + bonus_used
 
     if total_available < stake:
         return jsonify({"error": "Insufficient balance"}), 400
 
-    # Calculate total odds
     total_odds = 1
     for s in data["selections"]:
         total_odds *= float(s["odds"])
 
     possible_win = int(stake * total_odds)
 
-    # Create bet
     bet = Bet(
         user_id=user.id,
         stake=stake,
@@ -190,7 +273,6 @@ def place_bet():
     db.session.add(bet)
     db.session.flush()
 
-    # Add selections
     for s in data["selections"]:
         db.session.add(BetSelection(
             bet_id=bet.id,
@@ -198,11 +280,8 @@ def place_bet():
             odds=s["odds"]
         ))
 
-    # Deduct from balances
     user.balance -= real_money_used
     user.bonus_balance -= bonus_used
-    
-    # Track total wagered (only real money, not bonus)
     user.total_wagered += real_money_used
     
     db.session.commit()
@@ -218,20 +297,31 @@ def place_bet():
 
 @app.get("/api/bets/history")
 @jwt_required()
+@cache_response(duration=60)  # Cache for 1 minute
 def history():
     user_id = int(get_jwt_identity())
-    bets = Bet.query.filter_by(user_id=user_id).order_by(Bet.created_at.desc()).all()
+    
+    # OPTIMIZED: Use joinedload to reduce queries
+    from sqlalchemy.orm import joinedload
+    
+    bets = (
+        Bet.query
+        .options(joinedload(Bet.selections))
+        .filter_by(user_id=user_id)
+        .order_by(Bet.created_at.desc())
+        .limit(50)  # Limit to recent 50
+        .all()
+    )
 
     bet_history = []
     for bet in bets:
-        bet_selections = BetSelection.query.filter_by(bet_id=bet.id).all()
-        
-        selections = []
-        for bs in bet_selections:
-            selections.append({
+        selections = [
+            {
                 "candidate_name": bs.candidate_name,
                 "odds": bs.odds
-            })
+            }
+            for bs in bet.selections
+        ]
         
         bet_history.append({
             "id": bet.id,
@@ -247,18 +337,34 @@ def history():
     return jsonify(bet_history)
 
 
-# ---------------- REFERRAL STATS ----------------
+# ---------------- REFERRAL STATS (OPTIMIZED) ----------------
 @app.get("/api/referrals/stats")
 @jwt_required()
+@cache_response(duration=120)  # Cache for 2 minutes
 def referral_stats():
-    user = User.query.get(get_jwt_identity())
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
     
-    # Count successful referrals
-    referred_users = User.query.filter_by(referred_by=user.referral_code).count()
+    # OPTIMIZED: Use aggregation functions
+    referred_users = db.session.query(
+        func.count(User.id)
+    ).filter(
+        User.referred_by == user.referral_code
+    ).scalar()
     
-    # Total earnings from referrals
-    rewards = ReferralReward.query.filter_by(referrer_id=user.id).all()
-    total_earned = sum(r.reward_amount for r in rewards)
+    total_earned = db.session.query(
+        func.coalesce(func.sum(ReferralReward.reward_amount), 0)
+    ).filter(
+        ReferralReward.referrer_id == user.id
+    ).scalar()
+    
+    recent_rewards = (
+        ReferralReward.query
+        .filter_by(referrer_id=user.id)
+        .order_by(ReferralReward.created_at.desc())
+        .limit(5)
+        .all()
+    )
     
     return jsonify({
         "referral_code": user.referral_code,
@@ -269,7 +375,7 @@ def referral_stats():
                 "reward": r.reward_amount,
                 "date": r.created_at.isoformat()
             }
-            for r in rewards[-5:]  # Last 5 referrals
+            for r in recent_rewards
         ]
     })
 
@@ -283,7 +389,6 @@ def get_referral_earned_amount(user_id):
 
 
 # ---------------- WITHDRAW ----------------
-
 @app.post("/api/withdraw")
 @jwt_required()
 def withdraw():
@@ -291,18 +396,13 @@ def withdraw():
     data = request.json
     amount = int(data["amount"])
 
-    # Minimum withdrawal
     if amount < 1000:
         return jsonify({"error": "Minimum withdrawal is UGX 1,000"}), 400
 
-    # Cannot withdraw bonus
     if user.balance < amount:
         return jsonify({"error": "Insufficient balance"}), 400
 
-    # Referral earnings are NOT withdrawable
     referral_earned = get_referral_earned_amount(user.id)
-
-    # Max withdrawable = balance minus referral earnings
     withdrawable_amount = max(user.balance - referral_earned, 0)
 
     if withdrawable_amount <= 0:
@@ -315,7 +415,6 @@ def withdraw():
             "error": f"You can only withdraw up to UGX {withdrawable_amount:,}. Referral earnings are locked."
         }), 400
 
-    # Create withdrawal
     withdrawal = Withdrawal(
         user_id=user.id,
         amount=amount,
@@ -323,7 +422,6 @@ def withdraw():
         status="pending"
     )
 
-    # Deduct balance
     user.balance -= amount
 
     db.session.add(withdrawal)
@@ -336,11 +434,19 @@ def withdraw():
         "locked_referral_amount": referral_earned
     })
 
+
 @app.get("/api/withdrawals/history")
 @jwt_required()
+@cache_response(duration=120)  # Cache for 2 minutes
 def withdrawal_history():
     user_id = int(get_jwt_identity())
-    withdrawals = Withdrawal.query.filter_by(user_id=user_id).order_by(Withdrawal.created_at.desc()).all()
+    withdrawals = (
+        Withdrawal.query
+        .filter_by(user_id=user_id)
+        .order_by(Withdrawal.created_at.desc())
+        .limit(50)
+        .all()
+    )
     
     return jsonify([
         {
@@ -355,22 +461,29 @@ def withdrawal_history():
 
 
 @app.get("/admin/withdrawals")
+@cache_response(duration=30)  # Cache for 30 seconds
 def get_admin_withdrawals():
-    # Add admin authentication here if needed
-    withdrawals = Withdrawal.query.order_by(Withdrawal.created_at.desc()).all()
+    withdrawals = (
+        Withdrawal.query
+        .order_by(Withdrawal.created_at.desc())
+        .limit(100)
+        .all()
+    )
     
     result = []
     for w in withdrawals:
         user = User.query.get(w.user_id)
         
-        # Check if user has made any M-Pesa transactions
         has_mpesa = False
         if user:
-            mpesa_count = MpesaTransaction.query.filter_by(
-                user_id=user.id,
-                status='SUCCESS'
-            ).count()
-            has_mpesa = mpesa_count > 0
+            has_mpesa = db.session.query(
+                db.exists().where(
+                    db.and_(
+                        MpesaTransaction.user_id == user.id,
+                        MpesaTransaction.status == 'SUCCESS'
+                    )
+                )
+            ).scalar()
         
         result.append({
             "id": w.id,
@@ -386,7 +499,7 @@ def get_admin_withdrawals():
     
     return jsonify(result)
 
-# Update withdrawal status
+
 @app.put("/admin/withdrawals/<int:withdrawal_id>")
 def update_withdrawal_status(withdrawal_id):
     data = request.get_json()
@@ -409,12 +522,16 @@ def update_withdrawal_status(withdrawal_id):
             "status": withdrawal.status
         }
     })
+
+
 @app.get("/api/admin/users")
 @jwt_required()
+@cache_response(duration=60)  # Cache for 1 minute
 def list_users():
     users = (
         User.query
         .order_by(User.created_at.desc())
+        .limit(100)
         .all()
     )
 
@@ -429,8 +546,7 @@ def list_users():
     ])
 
 
-
-# ---------------- PAYMENTS ----------------
+# ---------------- PAYMENTS (MPESA) ----------------
 from services.mpesa import MpesaService
 
 @app.post("/api/payments/mpesa")
@@ -444,8 +560,6 @@ def mpesa_payment():
         amount = int(data.get("amount"))
     except Exception:
         return jsonify({"message": "Invalid phone number or amount"}), 400
-
-
 
     mpesa_phone = "254" + phone_local
 
@@ -493,7 +607,6 @@ def mpesa_callback():
 
         txn.status = "SUCCESS" if result_code == 0 else "FAILED"
 
-        # Credit user balance on success
         if result_code == 0:
             user = User.query.filter_by(phone=phone).first()
             if user:
@@ -508,10 +621,9 @@ def mpesa_callback():
         return jsonify({"message": "Callback failed"}), 500
 
 
-
-# ---------------- ADMIN MPESA ----------------
 @app.get("/api/admin/mpesa-transactions")
 @jwt_required()
+@cache_response(duration=60)  # Cache for 1 minute
 def admin_mpesa_transactions():
     transactions = (
         MpesaTransaction.query
@@ -532,7 +644,6 @@ def admin_mpesa_transactions():
     ])
 
 
-
 @app.post("/api/payments/mpesa/update_pending")
 def update_pending():
     try:
@@ -544,24 +655,49 @@ def update_pending():
         return jsonify({"message": "Failed to update pending"}), 500
 
 
-
-# ------------------------------
-# Elections & Candidates
-# ------------------------------
-
+# ---------------- ELECTIONS & CANDIDATES (OPTIMIZED) ----------------
+@app.get("/elections")
+@cache_response(duration=300)  # Cache for 5 minutes
+def get_elections():
+    # OPTIMIZED: Use joinedload
+    from sqlalchemy.orm import joinedload
+    
+    elections = (
+        Election.query
+        .options(joinedload(Election.candidates))
+        .all()
+    )
+    
+    result = []
+    for e in elections:
+        result.append({
+            "id": e.id,
+            "title": e.title,
+            "constituency": e.constituency,
+            "type": e.type,
+            "candidates": [
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "party": c.party,
+                    "odds": c.odds,
+                    "image": c.image
+                }
+                for c in e.candidates
+            ]
+        })
+    
+    return jsonify(result)
 
 
 @app.post("/election")
 def create_election():
-    """Create a new election"""
     data = request.json
     
-    # Check if election already exists
     existing = Election.query.get(data.get("id"))
     if existing:
         return jsonify({"error": "Election with this ID already exists"}), 400
     
-    # Validate required fields
     if not data.get("id") or not data.get("title"):
         return jsonify({"error": "ID and title are required"}), 400
     
@@ -579,40 +715,46 @@ def create_election():
 
 
 @app.get("/election/<string:id>")
+@cache_response(duration=300)
 def get_election(id):
-    """Get a single election with its candidates"""
-    election = Election.query.get(id)
+    from sqlalchemy.orm import joinedload
+    
+    election = (
+        Election.query
+        .options(joinedload(Election.candidates))
+        .filter_by(id=id)
+        .first()
+    )
     
     if not election:
         return jsonify({"error": "Election not found"}), 404
-    
-    candidates = Candidate.query.filter_by(election_id=election.id).all()
     
     return jsonify({
         "id": election.id,
         "title": election.title,
         "constituency": election.constituency,
         "type": election.type,
-        "candidates": [{
-            "id": c.id,
-            "name": c.name,
-            "party": c.party,
-            "odds": c.odds,
-            "image": c.image
-        } for c in candidates]
+        "candidates": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "party": c.party,
+                "odds": c.odds,
+                "image": c.image
+            }
+            for c in election.candidates
+        ]
     })
 
 
 @app.put("/election/<string:id>")
 def update_election(id):
-    """Update an existing election"""
     data = request.json
     election = Election.query.get(id)
     
     if not election:
         return jsonify({"error": "Election not found"}), 404
     
-    # Update fields
     election.title = data.get("title", election.title)
     election.constituency = data.get("constituency", election.constituency)
     election.type = data.get("type", election.type)
@@ -624,41 +766,17 @@ def update_election(id):
 
 @app.delete("/election/<string:id>")
 def delete_election(id):
-    """Delete an election and all its candidates"""
     election = Election.query.get(id)
     
     if not election:
         return jsonify({"error": "Election not found"}), 404
     
-    # Delete all candidates first (if no cascade is set)
     Candidate.query.filter_by(election_id=id).delete()
-    
-    # Delete the election
     db.session.delete(election)
     db.session.commit()
     
     return jsonify({"success": True})
 
-@app.get("/elections")
-def get_elections():
-    elections = Election.query.all()
-    result = []
-    for e in elections:
-        candidates = Candidate.query.filter_by(election_id=e.id).all()
-        result.append({
-            "id": e.id,
-            "title": e.title,
-            "constituency": e.constituency,
-            "type": e.type,
-            "candidates": [{
-                "id": c.id,
-                "name": c.name,
-                "party": c.party,
-                "odds": c.odds,
-                "image": c.image
-            } for c in candidates]
-        })
-    return jsonify(result)
 
 @app.post("/candidate")
 def create_candidate():
@@ -674,28 +792,32 @@ def create_candidate():
     db.session.commit()
     return jsonify({"success": True, "id": candidate.id})
 
+
 @app.put("/candidate/<int:id>")
 def update_candidate(id):
     data = request.json
     candidate = Candidate.query.get(id)
     if not candidate:
         return jsonify({"error": "Candidate not found"}), 404
+    
     candidate.name = data.get("name", candidate.name)
     candidate.party = data.get("party", candidate.party)
     candidate.odds = float(data.get("odds", candidate.odds))
     candidate.image = data.get("image", candidate.image)
+    
     db.session.commit()
     return jsonify({"success": True})
+
 
 @app.delete("/candidate/<int:id>")
 def delete_candidate(id):
     candidate = Candidate.query.get(id)
     if not candidate:
         return jsonify({"error": "Candidate not found"}), 404
+    
     db.session.delete(candidate)
     db.session.commit()
     return jsonify({"success": True})
-
 
 
 if __name__ == "__main__":
