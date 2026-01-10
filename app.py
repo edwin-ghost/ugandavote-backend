@@ -336,7 +336,7 @@ def withdraw():
         "locked_referral_amount": referral_earned
     })
 
-@app.get("/api/withdrawals/history")
+@app.get("/withdrawals/history")
 @jwt_required()
 def withdrawal_history():
     user_id = int(get_jwt_identity())
@@ -354,7 +354,7 @@ def withdrawal_history():
     ])
 
 # New Admin Endpoint - Get all withdrawal requests
-@app.get("/api/admin/withdrawals")
+@app.get("/admin/withdrawals")
 def get_admin_withdrawals():
     # Add admin authentication here if needed
     withdrawals = Withdrawal.query.order_by(Withdrawal.created_at.desc()).all()
@@ -373,7 +373,7 @@ def get_admin_withdrawals():
     ])
 
 # New Admin Endpoint - Update withdrawal status
-@app.put("/api/admin/withdrawals/<int:withdrawal_id>")
+@app.put("/admin/withdrawals/<int:withdrawal_id>")
 def update_withdrawal_status(withdrawal_id):
     data = request.get_json()
     status = data.get('status')
