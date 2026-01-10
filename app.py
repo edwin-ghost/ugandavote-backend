@@ -336,7 +336,6 @@ def withdraw():
         "locked_referral_amount": referral_earned
     })
 
-
 @app.get("/api/withdrawals/history")
 @jwt_required()
 def withdrawal_history():
@@ -354,7 +353,48 @@ def withdrawal_history():
         for w in withdrawals
     ])
 
+# New Admin Endpoint - Get all withdrawal requests
+@app.get("/api/admin/withdrawals")
+def get_admin_withdrawals():
+    # Add admin authentication here if needed
+    withdrawals = Withdrawal.query.order_by(Withdrawal.created_at.desc()).all()
+    
+    return jsonify([
+        {
+            "id": w.id,
+            "user_id": w.user_id,
+            "phone": User.query.get(w.user_id).phone if User.query.get(w.user_id) else "Unknown",
+            "amount": w.amount,
+            "method": w.method,
+            "status": w.status,
+            "created_at": w.created_at.isoformat()
+        }
+        for w in withdrawals
+    ])
 
+# New Admin Endpoint - Update withdrawal status
+@app.put("/api/admin/withdrawals/<int:withdrawal_id>")
+def update_withdrawal_status(withdrawal_id):
+    data = request.get_json()
+    status = data.get('status')
+    
+    if status not in ['pending', 'success', 'failed']:
+        return jsonify({"error": "Invalid status"}), 400
+    
+    withdrawal = Withdrawal.query.get(withdrawal_id)
+    if not withdrawal:
+        return jsonify({"error": "Withdrawal not found"}), 404
+    
+    withdrawal.status = status
+    db.session.commit()
+    
+    return jsonify({
+        "message": "Withdrawal status updated",
+        "withdrawal": {
+            "id": withdrawal.id,
+            "status": withdrawal.status
+        }
+    })
 
 @app.get("/api/admin/users")
 @jwt_required()
