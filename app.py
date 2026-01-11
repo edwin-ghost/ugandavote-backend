@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from threading import Thread
 import time
 import requests as req
+from utils.currency_utils import CurrencyConfig, get_user_country
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -112,48 +113,96 @@ if os.getenv("FLASK_ENV") == "production" or os.getenv("RENDER"):
     Thread(target=keep_alive, daemon=True).start()
 
 
+
+@app.get("/api/location/detect")
+def detect_location():
+    """Detect user location and return currency info"""
+    country = get_user_country(request)
+    currency_config = CurrencyConfig.get_currency_config(country)
+    
+    return jsonify({
+        "country": country,
+        "currency": currency_config['code'],
+        "symbol": currency_config['symbol'],
+        "min_deposit": currency_config['min_deposit'],
+        "min_withdrawal": currency_config['min_withdrawal'],
+        "signup_bonus": currency_config['signup_bonus']
+    })
+
+
 # ---------------- AUTH ----------------
 @app.post("/api/auth/register")
 def register():
     data = request.json
-
     try:
         phone = normalize_phone(data["phone"])
     except Exception:
         return jsonify({"error": "Invalid phone number"}), 400
-
+    
+    # Detect country
+    country = get_user_country(request)
+    currency_config = CurrencyConfig.get_currency_config(country)
+    
     referral_code = data.get("referralCode", "").strip().upper()
-
     if User.query.filter_by(phone=phone).first():
         return jsonify({"error": "User exists"}), 400
-
+    
+    # Convert signup bonus to base currency (UGX)
+    signup_bonus_base = CurrencyConfig.convert_to_base(
+        currency_config['signup_bonus'], 
+        country
+    )
+    
     user = User(
         phone=phone,
         pin_hash=generate_password_hash(data["pin"]),
-        balance=0,
-        bonus_balance=2500,
-        total_wagered=0
+        balance=signup_bonus_base,        # ✅ usable immediately
+        bonus_balance=signup_bonus_base,
+        total_wagered=0,
+        country_code=country  # Store user's country
     )
-
     user.referral_code = user.generate_referral_code()
-
+    
     if referral_code:
         referrer = User.query.filter_by(referral_code=referral_code).first()
         if referrer:
             user.referred_by = referral_code
-            referrer.balance += 10000
+            
+            # Convert referral reward based on referrer's country
+            referrer_config = CurrencyConfig.get_currency_config(referrer.country_code)
+            reward_base = CurrencyConfig.convert_to_base(
+                referrer_config['referral_reward'],
+                referrer.country_code
+            )
+            referrer.balance += reward_base
             
             reward = ReferralReward(
                 referrer_id=referrer.id,
                 referred_id=user.id,
-                reward_amount=10000
+                reward_amount=reward_base
             )
             db.session.add(reward)
-
+    
     db.session.add(user)
     db.session.commit()
-
+    
     token = create_access_token(identity=str(user.id))
+    
+    # Return currency info with user
+    return jsonify({
+        "token": token,
+        "user": {
+            "id": user.id,
+            "phone": user.phone,
+            "balance": user.balance,
+            "bonus_balance": user.bonus_balance,
+            "referral_code": user.referral_code,
+            "total_wagered": user.total_wagered,
+            "country_code": user.country_code,
+            "currency": currency_config['code'],
+            "currency_symbol": currency_config['symbol']
+        }
+    }), 201
 
     return jsonify({
         "token": token,
@@ -167,23 +216,21 @@ def register():
         }
     }), 201
 
-
 @app.post("/api/auth/login")
 def login():
     data = request.json
-
     try:
         phone = normalize_phone(data["phone"])
     except Exception:
         return jsonify({"error": "Invalid phone number"}), 400
-
+    
     user = User.query.filter_by(phone=phone).first()
-
     if not user or not check_password_hash(user.pin_hash, data["pin"]):
         return jsonify({"error": "Invalid login"}), 401
-
+    
     token = create_access_token(identity=str(user.id))
-
+    currency_config = CurrencyConfig.get_currency_config(user.country_code)
+    
     return jsonify({
         "token": token,
         "user": {
@@ -192,23 +239,33 @@ def login():
             "balance": user.balance,
             "bonus_balance": user.bonus_balance,
             "referral_code": user.referral_code,
-            "total_wagered": user.total_wagered
+            "total_wagered": user.total_wagered,
+            "country_code": user.country_code,
+            "currency": currency_config['code'],
+            "currency_symbol": currency_config['symbol']
         }
     })
+
 
 
 # ---------------- BALANCE (OPTIMIZED) ----------------
 @app.get("/api/balance")
 @jwt_required()
-@cache_response(duration=30)  # Cache for 30 seconds
+@cache_response(duration=30)
 def balance():
     user_id = get_jwt_identity()
     user = User.query.get(user_id)
     
     if not user:
         return jsonify({"error": "User not found"}), 404
-
-    # Optimized query using exists
+    
+    currency_config = CurrencyConfig.get_currency_config(user.country_code)
+    
+    # Convert from base currency (UGX) to user's currency
+    balance_local = CurrencyConfig.convert_from_base(user.balance, user.country_code)
+    bonus_local = CurrencyConfig.convert_from_base(user.bonus_balance, user.country_code)
+    wagered_local = CurrencyConfig.convert_from_base(user.total_wagered, user.country_code)
+    
     has_mpesa_txn = db.session.query(
         db.exists().where(
             db.and_(
@@ -217,20 +274,22 @@ def balance():
             )
         )
     ).scalar()
-
-    DISPLAY_RATE = 30 if has_mpesa_txn else 1
-    withdrawable = min(user.balance, user.total_wagered)
+    
+    # Only apply 30x multiplier for UGX users with M-Pesa
+    DISPLAY_RATE = 30 if (user.country_code == 'UG' and has_mpesa_txn) else 1
+    withdrawable = min(balance_local, wagered_local)
     
     return jsonify({
-        "balance": user.balance * DISPLAY_RATE,
-        "base_balance": user.balance,
-        "bonus_balance": user.bonus_balance,
+        "balance": balance_local * DISPLAY_RATE,
+        "base_balance": user.balance,  # Always UGX
+        "bonus_balance": bonus_local,
         "withdrawable": withdrawable,
-        "total_wagered": user.total_wagered,
-        "currency": "UGX",
+        "total_wagered": wagered_local,
+        "currency": currency_config['code'],
+        "currency_symbol": currency_config['symbol'],
+        "country_code": user.country_code,
         "mpesa_user": has_mpesa_txn
     })
-
 
 @app.post("/api/admin/balance")
 @jwt_required()
@@ -394,46 +453,63 @@ def get_referral_earned_amount(user_id):
 def withdraw():
     user = User.query.get(get_jwt_identity())
     data = request.json
-    amount = int(data["amount"])
-
-    if amount < 1000:
-        return jsonify({"error": "Minimum withdrawal is UGX 1,000"}), 400
-
-    if user.balance < amount:
+    
+    currency_config = CurrencyConfig.get_currency_config(user.country_code)
+    min_withdrawal = currency_config['min_withdrawal']
+    
+    # Amount comes in user's local currency
+    amount_local = int(data["amount"])
+    
+    if amount_local < min_withdrawal:
+        return jsonify({
+            "error": f"Minimum withdrawal is {currency_config['symbol']} {min_withdrawal:,}"
+        }), 400
+    
+    # Convert to base currency (UGX)
+    amount_base = CurrencyConfig.convert_to_base(amount_local, user.country_code)
+    
+    if user.balance < amount_base:
         return jsonify({"error": "Insufficient balance"}), 400
-
+    
     referral_earned = get_referral_earned_amount(user.id)
     withdrawable_amount = max(user.balance - referral_earned, 0)
-
+    
     if withdrawable_amount <= 0:
         return jsonify({
             "error": "Your balance is from referrals and cannot be withdrawn"
         }), 400
-
-    if amount > withdrawable_amount:
+    
+    if amount_base > withdrawable_amount:
+        withdrawable_local = CurrencyConfig.convert_from_base(
+            withdrawable_amount, 
+            user.country_code
+        )
         return jsonify({
-            "error": f"You can only withdraw up to UGX {withdrawable_amount:,}. Referral earnings are locked."
+            "error": f"You can only withdraw up to {currency_config['symbol']} {withdrawable_local:,}"
         }), 400
-
+    
     withdrawal = Withdrawal(
         user_id=user.id,
-        amount=amount,
+        amount=amount_base,  # Store in base currency
         method=data.get("method", "MTN"),
         status="pending"
     )
-
-    user.balance -= amount
-
+    user.balance -= amount_base
     db.session.add(withdrawal)
     db.session.commit()
-
+    
+    remaining_local = CurrencyConfig.convert_from_base(user.balance, user.country_code)
+    
     return jsonify({
         "message": "Withdrawal submitted successfully",
-        "amount": amount,
-        "remaining_balance": user.balance,
-        "locked_referral_amount": referral_earned
+        "amount": amount_local,
+        "currency": currency_config['code'],
+        "remaining_balance": remaining_local,
+        "locked_referral_amount": CurrencyConfig.convert_from_base(
+            referral_earned, 
+            user.country_code
+        )
     })
-
 
 @app.get("/api/withdrawals/history")
 @jwt_required()
@@ -548,34 +624,38 @@ def list_users():
 
 # ---------------- PAYMENTS (MPESA) ----------------
 from services.mpesa import MpesaService
-
 @app.post("/api/payments/mpesa")
 @jwt_required()
 def mpesa_payment():
     user = User.query.get(get_jwt_identity())
     data = request.json
-
+    
+    if user.country_code != 'KE':
+        return jsonify({"error": "M-Pesa only available in Kenya"}), 400
+    
     try:
         phone_local = normalize_phone(data.get("phone"))
-        amount = int(data.get("amount"))
+        # Amount comes in KSH
+        amount_ksh = int(data.get("amount"))
+        
+        # Convert to UGX for storage
+        amount_ugx = CurrencyConfig.convert_to_base(amount_ksh, 'KE')
     except Exception:
         return jsonify({"message": "Invalid phone number or amount"}), 400
-
+    
     mpesa_phone = "254" + phone_local
-
     mpesa = MpesaService()
     response = mpesa.stk_push(
         phone=mpesa_phone,
-        amount=amount,
+        amount=amount_ksh,  # Send KSH to M-Pesa
         reference=f"TOPUP-{user.id}",
         user_id=user.id
     )
-
+    
     return jsonify({
         "message": "STK Push sent",
         "mpesa": response
     })
-
 
 @app.post("/api/payments/mpesa/callback")
 def mpesa_callback():
