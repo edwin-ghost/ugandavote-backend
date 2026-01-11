@@ -114,7 +114,7 @@ if os.getenv("FLASK_ENV") == "production" or os.getenv("RENDER"):
 
 
 
-@app.get("/location/detect")
+@app.get("/api/location/detect")
 def detect_location():
     """Detect user location and return currency info"""
     country = get_user_country(request)
